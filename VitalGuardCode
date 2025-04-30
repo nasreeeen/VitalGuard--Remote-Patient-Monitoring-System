@@ -1,0 +1,333 @@
+Code:
+JAVASCRIPT CODE:
+
+import React, { useEffect, useState } from "react";
+import { database } from "./firebase";
+import { ref, onValue } from "firebase/database";
+import { Line } from "react-chartjs-2";
+import { Chart as ChartJS, LineElement, CategoryScale, LinearScale, PointElement, Tooltip } from "chart.js";
+import './VitalSigns.css'; // Import the external CSS file
+
+// Register Chart.js components
+ChartJS.register(LineElement, CategoryScale, LinearScale, PointElement, Tooltip);
+
+const VitalSigns = () => {
+  const [data, setData] = useState({
+    bpm: 0,
+    avg_bpm: 0,
+    spo2: 0,
+    temperature: 0,
+    ecg_voltage: [], // Array to store multiple ECG values for the graph
+    timestamp: "",
+    loading: true,
+    error: null,
+  });
+
+  useEffect(() => {
+    // Use the MAC address from the ESP32
+    const macAddress = "F0:24:F9:45:79:18"; // Replace with your device's MAC address
+    const dataRef = ref(database, `vital-data`);
+
+    const unsubscribe = onValue(dataRef, (snapshot) => {
+      try {
+        if (snapshot.exists()) {
+          const newData = snapshot.val();
+          console.log("Firebase Data:", newData); // Debug Firebase data
+
+          // Find the latest entry if the path contains multiple entries
+          let latestData = newData;
+          if (typeof newData === 'object' && !Array.isArray(newData)) {
+            latestData = Object.values(newData).pop() || {};
+          }
+
+          setData((prevState) => ({
+            timestamp: latestData.timestamp || prevState.timestamp || "",
+            temperature: latestData.temperature || prevState.temperature || 0,
+            spo2: latestData.spo2 || prevState.spo2 || 0,
+            bpm: latestData.bpm || prevState.bpm || 0,
+            avg_bpm: latestData.avg_bpm || prevState.avg_bpm || 0,
+            ecg_voltage: [...prevState.ecg_voltage.slice(-50), latestData.ecg_voltage || 0].slice(-50), // Keep last 50 ECG values
+            loading: false,
+            error: null,
+          }));
+        } else {
+          setData((prevState) => ({
+            ...prevState,
+            loading: false,
+            error: "No data available at this path.",
+          }));
+        }
+      } catch (error) {
+        console.error("Error fetching data:", error);
+        setData((prevState) => ({
+          ...prevState,
+          loading: false,
+          error: "Error fetching data: " + error.message,
+        }));
+      }
+    }, (error) => {
+      console.error("Firebase onValue error:", error);
+      setData((prevState) => ({
+        ...prevState,
+        loading: false,
+        error: "Firebase error: " + error.message,
+      }));
+    });
+
+    // Cleanup subscription on unmount
+    return () => unsubscribe();
+  }, []);
+
+  // ECG Graph Data
+  const ecgData = {
+    labels: Array.from({ length: data.ecg_voltage.length }, (_, i) => i + 1),
+    datasets: [
+      {
+        label: "ECG Voltage (mV)",
+        data: data.ecg_voltage,
+        borderColor: "#00FFAA",
+        backgroundColor: "rgba(0, 255, 170, 0.1)",
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.4,
+      },
+    ],
+  };
+
+  const ecgOptions = {
+    scales: {
+      x: { display: false },
+      y: { beginAtZero: false },
+    },
+    plugins: {
+      tooltip: { enabled: true },
+      legend: { display: false },
+    },
+    maintainAspectRatio: false,
+    animation: {
+      duration: 1000,
+      easing: "easeInOutQuad",
+    },
+  };
+
+  if (data.loading) {
+    return <div className="vital-container">Loading...</div>;
+  }
+
+  if (data.error) {
+    return <div className="vital-container">Error: {data.error}</div>;
+  }
+
+  return (
+    <div className="vital-container">
+      <h2 className="vital-title">VitalGuard: Real-Time Monitoring</h2>
+      <div className="timestamp">Last Updated: {data.timestamp || "Awaiting data..."} (IST)</div>
+      <div className="vital-grid">
+        <div className="vital-card temperature">
+          <span className="vital-label">Temperature</span>
+          <span className="vital-value">
+            {typeof data.temperature === "number" ? data.temperature.toFixed(1) : "--"} °C
+          </span>
+        </div>
+        <div className="vital-card spo2">
+          <span className="vital-label">SpO2</span>
+          <span className="vital-value">
+            {typeof data.spo2 === "number" ? data.spo2.toFixed(1) : "--"} %
+          </span>
+        </div>
+        <div className="vital-card bpm">
+          <span className="vital-label">Heart Rate</span>
+          <span className="vital-value">
+            {typeof data.bpm === "number" ? data.bpm.toFixed(0) : "--"} BPM
+          </span>
+        </div>
+        <div className="vital-card avg-bpm">
+          <span className="vital-label">Avg BPM</span>
+          <span className="vital-value">
+            {typeof data.avg_bpm === "number" ? data.avg_bpm.toFixed(0) : "--"} BPM
+          </span>
+        </div>
+      </div>
+      <div className="ecg-container">
+        <h3 className="ecg-title">ECG Waveform</h3>
+        <div className="ecg-chart">
+          <Line data={ecgData} options={ecgOptions} />
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default VitalSigns;
+
+ARDUINO CODE::
+
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+// WiFi credentials
+#define WIFI_SSID "IEDC Maker Studio"
+#define WIFI_PASSWORD "Iedcmks@2023"
+
+// Firebase credentials
+#define API_KEY "AIzaSyBy2z2m-dAmEofUqdWP47WwGt3U56mYoc4"
+#define DATABASE_URL "https://vital-guard-final-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+MAX30105 particleSensor;
+
+// Heart rate variables
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+unsigned long sendDataPrevMillis = 0;
+
+void connectToWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ Connected to WiFi");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    Serial.print("MAC: "); Serial.println(WiFi.macAddress());
+  } else {
+    Serial.println("❌ Failed to connect to WiFi!");
+  }
+}
+
+void setupTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  time_t now = time(nullptr);
+  while (now < 8 * 3600 * 2) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println("\n✅ Time synchronized");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Setup started...");
+
+  connectToWiFi();
+  setupTime();
+
+  // Initialize Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = "vitalguardmonitor@gmail.com";
+  auth.user.password = "VitalGuardS6EC";
+
+  // Disable cert verification for testing
+  config.cert.data = nullptr;
+
+  Serial.println("Initializing Firebase...");
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Wait for Firebase to become ready
+  unsigned long start = millis();
+  while (!Firebase.ready() && millis() - start < 15000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (Firebase.ready()) {
+    Serial.println("\n✅ Firebase initialized");
+  } else {
+    Serial.println("\n❌ Firebase failed to initialize!");
+    Serial.println("Reason: " + fbdo.errorReason());
+  }
+
+  // Initialize MAX30105
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("❌ MAX30102 not found. Using dummy values.");
+  } else {
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setPulseAmplitudeGreen(0);
+    Serial.println("✅ MAX30102 ready. Place finger on sensor.");
+  }
+}
+
+String getTimestamp() {
+  time_t now = time(nullptr);
+  char buf[20];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+  return String(buf);
+}
+
+void loop() {
+  long irValue = particleSensor.getIR();
+  long redValue = particleSensor.getRed();
+
+  if (checkForBeat(irValue)) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+    beatsPerMinute = 60 / (delta / 1000.0);
+    if (beatsPerMinute > 20 && beatsPerMinute < 255) {
+      rates[rateSpot++] = (byte)beatsPerMinute;
+      rateSpot %= RATE_SIZE;
+      beatAvg = 0;
+      for (byte i = 0; i < RATE_SIZE; i++) beatAvg += rates[i];
+      beatAvg /= RATE_SIZE;
+    }
+  }
+
+  if (millis() - sendDataPrevMillis > 2000) {
+    sendDataPrevMillis = millis();
+
+    float ratio = (redValue > 0 && irValue > 0) ? (float)redValue / irValue : 0;
+    float spo2 = 0;
+    if (ratio > 0) {
+      spo2 = 110 - 25 * ratio;
+      spo2 = constrain(spo2, 0, 100);
+    }
+
+    float temperature = random(360, 380) / 10.0;
+    float ecgVoltage = analogRead(34) * (3.3 / 4095.0);
+    String timestamp = getTimestamp();
+
+    FirebaseJson jsonData;
+    jsonData.set("timestamp", timestamp);
+    jsonData.set("temperature", temperature);
+    jsonData.set("ecg_voltage", ecgVoltage);
+    jsonData.set("bpm", beatsPerMinute);
+    jsonData.set("avg_bpm", beatAvg);
+    jsonData.set("spo2", spo2);
+
+    String macAddress = WiFi.macAddress();
+    String path = "/vital-data/" + macAddress;
+
+    if (Firebase.ready()) {
+      Serial.println("📤 Uploading to Firebase...");
+      if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &jsonData)) {
+        Serial.println("✅ Data uploaded!");
+      } else {
+        Serial.print("❌ Upload failed: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      Serial.println("❌ Firebase not ready!");
+    }
+  }
+}
